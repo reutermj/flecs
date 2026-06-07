@@ -1,6 +1,6 @@
 # Pipeline-parallelism spikes
 
-Four spikes investigating whether flecs can support a DIY pipeline-parallel
+Five spikes investigating whether flecs can support a DIY pipeline-parallel
 construct. They rely on the same invariant and confirm it with ThreadSanitizer
 (decisive signal) plus a negative control (proves the harness has teeth).
 
@@ -16,6 +16,7 @@ the caller's responsibility.
 | `option_b.c` | Can *different systems* be scheduled concurrently (task parallelism)? | Yes — gated by query-term conflict analysis |
 | `option_c.c` | Can data + system parallelism nest in one thread pool? | Yes — TSan-clean; concurrent same-query iteration is safe (except `order_by`) |
 | `option_d.c` | Is the `order_by` hazard ours or flecs'? | flecs' — it asserts `ECS_UNSUPPORTED`; the constraint is pre-existing, not introduced by our scheduler |
+| `option_e.c` | Is the term-based conflict analysis sound? | Only if systems declare all in-place access — undeclared `ecs_get` races; deferred `ecs_set` is safe |
 
 ---
 
@@ -237,3 +238,40 @@ TSAN_OPTIONS="halt_on_error=0" ./option_d_ndebug_tsan 4 20
 - **Conclusion:** the `order_by` restriction is a pre-existing flecs constraint,
   identical for flecs' built-in multithreading and for our scheduler. We inherit
   it; we do not introduce it.
+
+---
+
+# Option E: soundness precondition of the conflict analysis
+
+`option_e.c` probes the assumption the whole conflict-analysis model rests on:
+the analysis only sees a system's **declared** query terms, but a callback can
+touch other components via the direct API.
+
+- `ecs_get(world, e, T)` — in-place read of frozen storage, **not** deferred.
+- `ecs_set/add/remove`   — deferred to the stage, applied at the serial merge.
+
+So an *undeclared* `ecs_get` is invisible to the analysis and can race; an
+undeclared `ecs_set` is safe (deferred).
+
+```sh
+gcc -g -O1 -I. option_e.c flecs.c -o option_e -lpthread -lm
+./option_e 0   # B reads Position via ecs_get (undeclared) -> conflict=0 (false negative)
+./option_e 1   # B declares [in Position] -> conflict=1 (analysis prevents co-scheduling)
+./option_e 2   # B does ecs_set(Other) undeclared (deferred) -> conflict=0 and genuinely safe
+
+gcc -g -O1 -fsanitize=thread -DN=20000 -I. option_e.c flecs.c -o option_e_tsan -lpthread -lm
+TSAN_OPTIONS="halt_on_error=0" ./option_e_tsan 0   # REAL race in Sys_ReadVel (ecs_get vs ecs_field write)
+TSAN_OPTIONS="halt_on_error=0" ./option_e_tsan 2   # clean (deferred write never races)
+```
+
+## Findings
+
+- **The analysis is only sound if systems declare every in-place access.** Mode 0
+  is judged `conflict=0` yet TSan reports a real race (`Sys_ReadVel`, the
+  undeclared `ecs_get(Position)` vs the in-place write). Declaring `[in Position]`
+  (mode 1) makes the analysis flag the conflict.
+- **Deferred ops are exempt.** Mode 2's undeclared `ecs_set` is TSan-clean — it is
+  buffered to the stage and never races with in-place access.
+- **Precondition:** a system must declare (in its terms) every component it reads
+  via `ecs_get` or accesses via `ecs_field`. This is the same contract flecs' own
+  pipeline assumes; it is inherited, not introduced.

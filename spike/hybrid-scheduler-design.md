@@ -179,8 +179,30 @@ The scheduler is correct as long as it upholds the same invariant flecs relies o
    direct world mutation off the main thread). Enforced by the readonly window.
 3. **Concurrently-running systems are conflict-free** (the wave invariant). Within
    a single system, workers process disjoint entity slices, so their direct
-   component-value writes never overlap.
+   component-value writes never overlap. **This requires the soundness
+   precondition below** — the conflict analysis is only correct if it can see
+   every in-place access.
 4. **One serial merge per wave**, on one thread, after all tasks complete.
+
+### Soundness precondition (systems must declare in-place access)
+
+The conflict analysis inspects only a system's **declared query terms**. It is
+therefore correct only if every component a system touches *in place* is
+declared:
+
+- `ecs_field(it, T, i)` — always declared (it requires a term). Safe.
+- `ecs_get(world, e, T)` — an **in-place read of frozen storage**. If `T` is not
+  a declared term, the analysis can't see it, and the system may be co-scheduled
+  with another that writes `T` in place → **real race** (verified, `option_e.c`).
+- `ecs_set` / `ecs_add` / `ecs_remove` — **deferred** to the stage and applied at
+  the serial merge. These never race with in-place access and need not be
+  declared for race-safety (they still matter for cross-wave ordering).
+
+So: **a system must declare (in its terms) every component it reads via
+`ecs_get` or accesses via `ecs_field`.** This is the same contract flecs' own
+pipeline assumes — its sync-point analysis also only inspects declared terms, and
+it overlaps systems within an op, so an undeclared `ecs_get` races there too. We
+inherit the expectation; we do not introduce it.
 
 flecs' debug build provides violation detectors (`table->_->lock`, readonly
 assertions) and `ecs_access_begin` access counters that fire on many illegal
@@ -239,6 +261,8 @@ patterns; ThreadSanitizer is the decisive check for value-write races.
 | Edge cases: pairs, wildcards, `up`/shared reads, `Not`+`Out`, `InOutNone` | `option_b.c` | access extraction + conflict matrix self-check pass |
 | Data + system parallelism nest (stage ≠ slice) | source review (`system.c:75-103`) | confirmed |
 | Hybrid pool: multiple `multi_threaded` systems split into stripes, drained from one shared queue over thread-owned stages | `option_c.c` | TSan-clean; concurrent same-query iteration safe (see §8); conflict control races on Pos as predicted |
+| `order_by` + multithreaded is a flecs constraint, not ours | `option_d.c` | flecs asserts `ECS_UNSUPPORTED`; races in its own sort path with the guard removed |
+| Soundness precondition: undeclared in-place `ecs_get` breaks the analysis; deferred `ecs_set` is safe | `option_e.c` | undeclared read races (false negative); declaring the term flags the conflict; deferred write is clean |
 
 ---
 

@@ -10,3 +10,5 @@ option_c
 option_c_tsan
 option_d
 option_d_ndebug_tsan
+option_e
+option_e_tsan
