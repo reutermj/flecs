@@ -6,3 +6,5 @@ option_a_tsan
 option_b
 option_b_tsan
 *.log
+option_c
+option_c_tsan

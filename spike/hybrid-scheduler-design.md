@@ -203,9 +203,19 @@ patterns; ThreadSanitizer is the decisive check for value-write races.
   that actually touch disjoint entities. Acceptable to start; could be refined
   later (e.g. archetype-level analysis) if it limits parallelism in practice.
 - **Concurrent iteration of the *same* query** (a system's own data-parallel
-  workers) touches shared per-query change-detection state. flecs does this in its
-  own pipeline, but our off-the-beaten-path composition has **not yet been
-  verified under TSan**. This is the one open correctness risk — see §10.
+  workers) — **verified TSan-clean** by `option_c.c`. The only shared writes on
+  this path are two non-atomic stats counters (`q->eval_count`,
+  `world->info.queries_ran_total`) and one change-detection snapshot
+  (`cache->prev_match_count = cache->match_count`, cache.c iter-init). The latter
+  is a benign idempotent race: during the readonly window `match_count` is
+  constant (cache mutations happen at merge), so every worker writes the same
+  stable value and nothing reads it until after the merge. No shared cursor or
+  match-list mutation; no data corruption.
+  - **Exception — `order_by` / sorted queries.** Their iter-init *sorts the cache*
+    (`flecs_query_cache_sort_tables`), a real shared mutation that is **not** safe
+    under concurrent iteration. Data-parallel systems must avoid `order_by` (or
+    the sort must be performed once before the wave). `group_by` should be
+    re-checked similarly before relying on it.
 - **Table-advance overhead** of fine-grained chunking is understood but treated as
   an implementation detail; not a design driver. Default to `K ∈ {1..W}` and only
   revisit if profiling demands it.
@@ -220,19 +230,21 @@ patterns; ThreadSanitizer is the decisive check for value-write races.
 | Two phases concurrent, disjoint writes | `option_a.c` | TSan-clean; conflict control races as predicted |
 | Multi-system scheduling via term conflict analysis | `option_b.c` | TSan-clean wave of 7 systems; 3 negative controls race exactly where the matrix predicts |
 | Edge cases: pairs, wildcards, `up`/shared reads, `Not`+`Out`, `InOutNone` | `option_b.c` | access extraction + conflict matrix self-check pass |
-| Data + system parallelism nest (stage ≠ slice) | source review (`system.c:75-103`) | confirmed; not yet exercised in a spike |
+| Data + system parallelism nest (stage ≠ slice) | source review (`system.c:75-103`) | confirmed |
+| Hybrid pool: multiple `multi_threaded` systems split into stripes, drained from one shared queue over thread-owned stages | `option_c.c` | TSan-clean; concurrent same-query iteration safe (see §8); conflict control races on Pos as predicted |
 
 ---
 
 ## 10. Open questions / next steps
 
-1. **Hybrid spike (`option_c`).** Run two `multi_threaded` systems, each split
-   across a block of stages, concurrently in one readonly window, under TSan —
-   with an imbalanced workload to show threads from a finished system picking up
-   another's work. This also directly stresses the change-detection path (§8).
-2. **Change-detection under concurrency.** Confirm (or characterize) whether
-   concurrent iteration of one query's data-parallel workers is race-free, and
-   whether change detection needs to be disabled/handled for scheduled systems.
+1. ~~**Hybrid spike (`option_c`).**~~ **Done** — `option_c.c`: W threads, one
+   stage each, draining a shared queue of `(system, k, K)` stripes across three
+   `multi_threaded` systems in one readonly window. TSan-clean; conflict control
+   races as predicted. Confirms data + system parallelism nest at runtime.
+2. ~~**Change-detection under concurrency.**~~ **Characterized** (§8): safe for
+   normal cached queries (only benign stats counters + an idempotent
+   `prev_match_count` write); **unsafe for `order_by`/sorted queries**, which must
+   be excluded or sorted once before the wave.
 3. **Wave packing algorithm.** Greedy list-schedule first; evaluate whether
    ordering constraints + conflict graph leave enough parallelism on real
    pipelines, and whether a smarter packing helps.

@@ -1,7 +1,7 @@
 # Pipeline-parallelism spikes
 
-Two spikes investigating whether flecs can support a DIY pipeline-parallel
-construct. Both rely on the same invariant and confirm it with ThreadSanitizer
+Three spikes investigating whether flecs can support a DIY pipeline-parallel
+construct. All rely on the same invariant and confirm it with ThreadSanitizer
 (decisive signal) plus a negative control (proves the harness has teeth).
 
 The invariant: freeze the world once (`ecs_readonly_begin`), run concurrent
@@ -14,6 +14,7 @@ the caller's responsibility.
 |-------|----------|--------|
 | `option_a.c` | Can two phases run concurrently on one world? | Yes — disjoint writes, no real races |
 | `option_b.c` | Can *different systems* be scheduled concurrently (task parallelism)? | Yes — gated by query-term conflict analysis |
+| `option_c.c` | Can data + system parallelism nest in one thread pool? | Yes — TSan-clean; concurrent same-query iteration is safe (except `order_by`) |
 
 ---
 
@@ -163,3 +164,43 @@ non-conflicting systems, (c) runs each on its own stage during a single
 readonly window, and (d) merges serially. The term metadata needed for (a) is
 already public via `ecs_system_get`, and `flecs_pipeline_check_term` is the
 reference for resolving it.
+
+---
+
+# Option C: data + system parallelism in one pool
+
+`option_c.c` validates the hybrid model at runtime: **W threads, one stage each
+(1:1)**, draining a single shared atomic work queue of `(system, k, K)` stripes
+drawn from several `multi_threaded`, conflict-free systems. A thread runs each
+task via `ecs_run_worker(my_stage, sys, k, K)` — the stage it defers to (its
+thread id) is **decoupled** from the slice index `k`, which is what lets any
+thread pick up any system's stripe while keeping a private, race-free buffer.
+
+This is the first spike to stress **concurrent iteration of the same query** (a
+system's own data-parallel workers), i.e. the change-detection path.
+
+```sh
+gcc -g -O1 -I. option_c.c flecs.c -o option_c -lpthread -lm
+./option_c 0   # hybrid wave {Move, Decay, Spin} -> PASS
+
+gcc -g -O1 -fsanitize=thread -DN=40000 -I. option_c.c flecs.c -o option_c_tsan -lpthread -lm
+TSAN_OPTIONS="halt_on_error=0" ./option_c_tsan 0   # only benign counters + idempotent change-detection write
+TSAN_OPTIONS="halt_on_error=0" ./option_c_tsan 1   # Move + Move2 both write Pos -> race in Sys_Move
+```
+
+## Findings
+
+- **Data + system parallelism nest cleanly.** Three systems, each split into W
+  stripes, all stripes in one queue, drained by W threads on thread-owned stages:
+  TSan-clean (no component-storage races), correct results, one merge.
+- **Concurrent same-query iteration is safe** for normal cached queries. The only
+  shared writes are `q->eval_count` and `world->info.queries_ran_total` (benign
+  non-atomic stat counters) and `cache->prev_match_count = cache->match_count` —
+  a benign idempotent race, because `match_count` is constant during the frozen
+  readonly window. No shared cursor, no match-list mutation, no data corruption.
+- **Caveat:** `order_by` queries sort the cache at iter-init
+  (`flecs_query_cache_sort_tables`) — a real shared mutation, **unsafe** under
+  concurrent iteration. Exclude sorted queries from data-parallel scheduling (or
+  sort once before the wave).
+- **Negative control** (`Move` + `Move2` both writing Pos) races in `Sys_Move` as
+  the conflict analysis predicts.
