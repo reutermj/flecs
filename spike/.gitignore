@@ -3,4 +3,6 @@ flecs.c
 flecs.h
 option_a
 option_a_tsan
+option_b
+option_b_tsan
 *.log
