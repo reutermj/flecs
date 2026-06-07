@@ -213,9 +213,16 @@ patterns; ThreadSanitizer is the decisive check for value-write races.
   match-list mutation; no data corruption.
   - **Exception — `order_by` / sorted queries.** Their iter-init *sorts the cache*
     (`flecs_query_cache_sort_tables`), a real shared mutation that is **not** safe
-    under concurrent iteration. Data-parallel systems must avoid `order_by` (or
-    the sort must be performed once before the wave). `group_by` should be
-    re-checked similarly before relying on it.
+    under concurrent iteration. **This is a pre-existing flecs constraint, not one
+    our scheduler introduces:** flecs guards it with an explicit assert,
+    `ECS_UNSUPPORTED` *"cannot sort query in multithreaded mode"*
+    (`flecs_query_cache_build_sorted_table_range`, flecs.c). flecs' own
+    `ecs_set_threads` pipeline aborts on a `multi_threaded` `order_by` system whose
+    keys change; with the guard compiled out (`NDEBUG`) flecs itself races in its
+    sort path. So the rule is the same for our scheduler and flecs': do not
+    data-parallelize `order_by` systems (or perform the sort once, single-threaded,
+    before the wave). `group_by` should be re-checked similarly. Verified by
+    `option_d.c`.
 - **Table-advance overhead** of fine-grained chunking is understood but treated as
   an implementation detail; not a design driver. Default to `K ∈ {1..W}` and only
   revisit if profiling demands it.

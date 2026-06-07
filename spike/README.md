@@ -1,7 +1,7 @@
 # Pipeline-parallelism spikes
 
-Three spikes investigating whether flecs can support a DIY pipeline-parallel
-construct. All rely on the same invariant and confirm it with ThreadSanitizer
+Four spikes investigating whether flecs can support a DIY pipeline-parallel
+construct. They rely on the same invariant and confirm it with ThreadSanitizer
 (decisive signal) plus a negative control (proves the harness has teeth).
 
 The invariant: freeze the world once (`ecs_readonly_begin`), run concurrent
@@ -15,6 +15,7 @@ the caller's responsibility.
 | `option_a.c` | Can two phases run concurrently on one world? | Yes — disjoint writes, no real races |
 | `option_b.c` | Can *different systems* be scheduled concurrently (task parallelism)? | Yes — gated by query-term conflict analysis |
 | `option_c.c` | Can data + system parallelism nest in one thread pool? | Yes — TSan-clean; concurrent same-query iteration is safe (except `order_by`) |
+| `option_d.c` | Is the `order_by` hazard ours or flecs'? | flecs' — it asserts `ECS_UNSUPPORTED`; the constraint is pre-existing, not introduced by our scheduler |
 
 ---
 
@@ -204,3 +205,35 @@ TSAN_OPTIONS="halt_on_error=0" ./option_c_tsan 1   # Move + Move2 both write Pos
   sort once before the wave).
 - **Negative control** (`Move` + `Move2` both writing Pos) races in `Sys_Move` as
   the conflict analysis predicts.
+
+---
+
+# Option D: is the order_by hazard flecs' own?
+
+`option_d.c` answers whether the `order_by` concurrency hazard found in Option C
+is specific to our DIY pool or inherent to flecs. It runs a `multi_threaded`
+`order_by` system in **flecs' own** native pipeline (`ecs_set_threads` +
+`ecs_progress`), mutating the sort key each frame to force re-sorting.
+
+```sh
+gcc -g -O1 -I. option_d.c flecs.c -o option_d -lpthread -lm
+./option_d 4 40        # debug build -> ABORTS:
+                       # "cannot sort query in multithreaded mode" (ECS_UNSUPPORTED)
+
+# guard compiled out (NDEBUG) under TSan -> flecs' own sort path races
+gcc -g -O1 -DNDEBUG -fsanitize=thread -DN=8000 -I. option_d.c flecs.c -o option_d_ndebug_tsan -lpthread -lm
+TSAN_OPTIONS="halt_on_error=0" ./option_d_ndebug_tsan 4 20
+```
+
+## Findings
+
+- flecs **explicitly guards** `order_by` + multithreaded: an assert
+  `ECS_UNSUPPORTED` ("cannot sort query in multithreaded mode") in
+  `flecs_query_cache_build_sorted_table_range` (flecs.c) fires the moment a sort
+  is needed during multithreaded iteration. flecs' native pipeline aborts on it.
+- With the guard removed (`NDEBUG`), flecs' own pipeline races in its sort path
+  (`build_sorted_table_range`, `sort_tables`) and on the component data itself —
+  proving the assert is the only thing preventing the race.
+- **Conclusion:** the `order_by` restriction is a pre-existing flecs constraint,
+  identical for flecs' built-in multithreading and for our scheduler. We inherit
+  it; we do not introduce it.
