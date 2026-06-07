@@ -15,3 +15,6 @@ option_e_tsan
 scheduler_demo
 scheduler_demo_tsan
 *.out
+sc_big
+sc_small
+scheduler_concurrency

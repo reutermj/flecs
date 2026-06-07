@@ -337,3 +337,22 @@ schedule: 7 systems, 8 threads, 3 waves, 56 tasks
   declare it via a phase or `DependsOn` (entity id is otherwise arbitrary).
 - `DependsOn` depth is recomputed per build (cheap for shallow chains); a memo
   would help very deep graphs.
+
+## Verifying we get *both* kinds of parallelism
+
+`scheduler_concurrency.c` instruments the running scheduler: each task records the
+peak number of concurrent stripes of its own system (data parallelism) and the
+peak number of *distinct* systems running at once (system parallelism).
+
+```sh
+gcc -O2 -DN=100000 -I. scheduler_concurrency.c scheduler.c flecs.c -o sc_big   -lpthread -lm
+gcc -O2 -DN=12000  -I. scheduler_concurrency.c scheduler.c flecs.c -o sc_small -lpthread -lm
+./sc_big 8 30     # K=8: data-parallel-heavy
+./sc_small 8 30   # K=3: more sustained system parallelism
+```
+
+Measured (8 threads): **data parallelism** reaches up to K concurrent stripes per
+system, and **system parallelism** reaches 3 distinct systems at once (the max the
+wave structure allows). Both are always present; `K` (the grain) sets the balance
+— large K saturates the pool per system (system overlap only at wave edges), small
+K lets several systems run side by side throughout a wave.
