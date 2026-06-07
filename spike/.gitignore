@@ -1,0 +1,6 @@
+# Build artifacts and copied amalgamation (regenerate from distr/)
+flecs.c
+flecs.h
+option_a
+option_a_tsan
+*.log
