@@ -275,3 +275,54 @@ TSAN_OPTIONS="halt_on_error=0" ./option_e_tsan 2   # clean (deferred write never
 - **Precondition:** a system must declare (in its terms) every component it reads
   via `ecs_get` or accesses via `ecs_field`. This is the same contract flecs' own
   pipeline assumes; it is inherited, not introduced.
+
+---
+
+# The scheduler (`scheduler.h` / `scheduler.c`)
+
+A working hybrid scheduler assembled from the validated findings, built entirely
+on flecs' public API. `scheduler_demo.c` exercises it on a realistic graph.
+
+Pipeline: conflict analysis (from query terms) -> greedy order-preserving wave
+packing -> adaptive per-system width K -> a thread pool (one stage per thread)
+draining a shared `(system, k, K)` queue, with one serial merge between waves.
+
+```sh
+gcc -g -O1 -I. scheduler_demo.c scheduler.c flecs.c -o scheduler_demo -lpthread -lm
+./scheduler_demo 8 10     # 8 threads, 10 frames
+
+gcc -g -O1 -fsanitize=thread -DN=20000 -I. scheduler_demo.c scheduler.c flecs.c -o scheduler_demo_tsan -lpthread -lm
+TSAN_OPTIONS="halt_on_error=0" ./scheduler_demo_tsan 8 8
+```
+
+Demo system graph (registered in order): Gravity -> Move -> {AI, Render}, plus
+independent Decay/Spin. The scheduler discovers the structure automatically:
+
+```
+schedule: 6 systems, 8 threads, 3 waves, 48 tasks
+  wave 0: Gravity(K=8)                          # data parallel only
+  wave 1: Move(K=8)                             # depends on Vel from wave 0
+  wave 2: AI(K=8) Render(K=8) Decay(K=8) Spin(K=8)   # data + system parallel
+```
+
+## Findings
+
+- **Correct.** Verified analytically against ground truth — after F frames every
+  one of N entities has exactly the expected component values (0 mismatches).
+  Conflict-free waves make the result order-independent, hence deterministic.
+- **TSan-clean.** Running the whole scheduler under ThreadSanitizer reports zero
+  races in any system callback; all warnings are the known-benign non-atomic stat
+  counters (`eval_count`, `queries_ran_total`) and the idempotent
+  `prev_match_count` change-detection write (see Option C).
+- **Hybrid in action.** Waves 0/1 are pure data parallelism (one system over 8
+  threads); wave 2 is data + system parallelism (4 systems x 8 stripes = 32 tasks
+  over 8 threads, work-shared from one queue).
+
+## Known limitations (construction, not correctness)
+
+- Greedy wave packing is *contiguous*: independent systems listed late (Decay,
+  Spin) aren't floated into earlier waves. A smarter packer could.
+- Threads are spawned per frame (fork-join); a persistent pool would cut that
+  overhead. Performance was explicitly out of scope for this investigation.
+- Respects only the linear registration order; flecs phase boundaries are not
+  treated as hard barriers (add them if phase semantics must be preserved).

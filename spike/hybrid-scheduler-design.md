@@ -263,6 +263,7 @@ patterns; ThreadSanitizer is the decisive check for value-write races.
 | Hybrid pool: multiple `multi_threaded` systems split into stripes, drained from one shared queue over thread-owned stages | `option_c.c` | TSan-clean; concurrent same-query iteration safe (see §8); conflict control races on Pos as predicted |
 | `order_by` + multithreaded is a flecs constraint, not ours | `option_d.c` | flecs asserts `ECS_UNSUPPORTED`; races in its own sort path with the guard removed |
 | Soundness precondition: undeclared in-place `ecs_get` breaks the analysis; deferred `ecs_set` is safe | `option_e.c` | undeclared read races (false negative); declaring the term flags the conflict; deferred write is clean |
+| End-to-end scheduler (conflict analysis -> waves -> adaptive K -> pool -> merge) | `scheduler.c` / `scheduler_demo.c` | auto-discovers dependency waves; analytically correct (0 mismatches); TSan-clean (no callback races) |
 
 ---
 
@@ -276,11 +277,14 @@ patterns; ThreadSanitizer is the decisive check for value-write races.
    normal cached queries (only benign stats counters + an idempotent
    `prev_match_count` write); **unsafe for `order_by`/sorted queries**, which must
    be excluded or sorted once before the wave.
-3. **Wave packing algorithm.** Greedy list-schedule first; evaluate whether
-   ordering constraints + conflict graph leave enough parallelism on real
-   pipelines, and whether a smarter packing helps.
-4. **Width selection policy.** How to choose `K` per system (static heuristic by
-   matched-entity count vs. measured cost feedback).
+3. **Wave packing algorithm.** *Initial implementation exists* (`scheduler.c`:
+   greedy *contiguous* order-preserving packing). Still open: a smarter packer
+   that floats independent systems into earlier waves instead of keeping strict
+   contiguity.
+4. **Width selection policy.** *Initial implementation exists* (`scheduler.c`:
+   `K = clamp(ceil(entities / GRAIN), 1, threads)`, `K = 1` for
+   non-`multi_threaded` systems). Still open: cost-feedback sizing vs. the static
+   entity-count heuristic.
 5. **Benchmark vs. built-in pipeline.** Compare frame time against `ecs_progress`
    + `ecs_set_threads` on representative system sets (many-small-systems and
    few-large-systems workloads) to confirm the hybrid actually wins.
