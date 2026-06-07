@@ -283,9 +283,16 @@ TSAN_OPTIONS="halt_on_error=0" ./option_e_tsan 2   # clean (deferred write never
 A working hybrid scheduler assembled from the validated findings, built entirely
 on flecs' public API. `scheduler_demo.c` exercises it on a realistic graph.
 
-Pipeline: conflict analysis (from query terms) -> greedy order-preserving wave
-packing -> adaptive per-system width K -> a thread pool (one stage per thread)
-draining a shared `(system, k, K)` queue, with one serial merge between waves.
+Pipeline: ordering from flecs `DependsOn`/phase depth -> conflict analysis (from
+query terms) -> level-aware wave packing -> adaptive per-system width K -> a
+thread pool (one stage per thread) draining a shared `(system, k, K)` queue,
+with one serial merge between waves.
+
+**Ordering reuses flecs' own relationships** (no new ordering API): assign a
+system to a phase for broad "after all previous-stage systems" ordering, and add
+`DependsOn(B, A)` for fine-grained edges. A system's *depth* is its longest
+`DependsOn` path; same depth => independent (parallel candidates); deeper =>
+later. Registration order is irrelevant.
 
 ```sh
 gcc -g -O1 -I. scheduler_demo.c scheduler.c flecs.c -o scheduler_demo -lpthread -lm
@@ -295,37 +302,38 @@ gcc -g -O1 -fsanitize=thread -DN=20000 -I. scheduler_demo.c scheduler.c flecs.c 
 TSAN_OPTIONS="halt_on_error=0" ./scheduler_demo_tsan 8 8
 ```
 
-Demo system graph (registered in order): Gravity -> Move -> {AI, Render}, plus
-independent Decay/Spin. The scheduler discovers the structure automatically:
+Demo graph: Gravity/Move/Decay/Spin in `OnUpdate` (Move `DependsOn` Gravity),
+AI/Render/Audio in `PostUpdate`; Audio is independent of everything. Systems are
+registered in *scrambled* order to prove order comes from phases/`DependsOn`:
 
 ```
-schedule: 6 systems, 8 threads, 3 waves, 48 tasks
-  wave 0: Gravity(K=8)                          # data parallel only
-  wave 1: Move(K=8)                             # depends on Vel from wave 0
-  wave 2: AI(K=8) Render(K=8) Decay(K=8) Spin(K=8)   # data + system parallel
+schedule: 7 systems, 8 threads, 3 waves, 56 tasks
+  wave 0: Gravity(d=5) Decay(d=5) Spin(d=5)     # OnUpdate, independent -> packed together
+  wave 1: Move(d=6)                             # DependsOn Gravity (+ Vel conflict)
+  wave 2: AI(d=7) Render(d=7) Audio(d=7)        # PostUpdate -> after all OnUpdate systems
 ```
 
 ## Findings
 
 - **Correct.** Verified analytically against ground truth — after F frames every
-  one of N entities has exactly the expected component values (0 mismatches).
-  Conflict-free waves make the result order-independent, hence deterministic.
-- **TSan-clean.** Running the whole scheduler under ThreadSanitizer reports zero
-  races in any system callback; all warnings are the known-benign non-atomic stat
-  counters (`eval_count`, `queries_ran_total`) and the idempotent
-  `prev_match_count` change-detection write (see Option C).
-- **Hybrid in action.** Waves 0/1 are pure data parallelism (one system over 8
-  threads); wave 2 is data + system parallelism (4 systems x 8 stripes = 32 tasks
-  over 8 threads, work-shared from one queue).
+  one of N entities has exactly the expected component values (0 mismatches),
+  with registration order scrambled.
+- **TSan-clean.** Zero races in any system callback; all warnings are the
+  known-benign non-atomic stat counters (`eval_count`, `queries_ran_total`) and
+  the idempotent `prev_match_count` change-detection write (see Option C).
+- **Ordering reuse works.** Depths are derived purely from flecs phases +
+  `DependsOn`. **Audio** has no data conflict with anything, yet lands in wave 2
+  solely because of its `PostUpdate` phase — broad phase ordering for an
+  independent system, which a conflict-only scheme could not provide.
+- **Better packing.** Independent same-depth systems (Decay, Spin) pack into the
+  earliest valid wave instead of being stuck in registration order.
 
 ## Known limitations (construction, not correctness)
 
-- Greedy wave packing is *contiguous*: independent systems listed late (Decay,
-  Spin) aren't floated into earlier waves. A smarter packer could.
 - Threads are spawned per frame (fork-join); a persistent pool would cut that
   overhead. Performance was explicitly out of scope for this investigation.
-- Ignores flecs phase metadata: it uses the linear order passed to
-  `scheduler_add`, whereas flecs *derives* its run order from phase `DependsOn`
-  chains. To honor phases, feed systems in phase order. (Note: neither flecs nor
-  this scheduler syncs at a phase boundary per se — both insert merges only at
-  data hazards; phases only set the order.)
+- Same-depth data conflicts get their direction from entity-id order (flecs'
+  within-phase tiebreak). If you need a specific order with *no* data conflict,
+  declare it via a phase or `DependsOn` (entity id is otherwise arbitrary).
+- `DependsOn` depth is recomputed per build (cheap for shallow chains); a memo
+  would help very deep graphs.

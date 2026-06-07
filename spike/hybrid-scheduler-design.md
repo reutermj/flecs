@@ -264,6 +264,7 @@ patterns; ThreadSanitizer is the decisive check for value-write races.
 | `order_by` + multithreaded is a flecs constraint, not ours | `option_d.c` | flecs asserts `ECS_UNSUPPORTED`; races in its own sort path with the guard removed |
 | Soundness precondition: undeclared in-place `ecs_get` breaks the analysis; deferred `ecs_set` is safe | `option_e.c` | undeclared read races (false negative); declaring the term flags the conflict; deferred write is clean |
 | End-to-end scheduler (conflict analysis -> waves -> adaptive K -> pool -> merge) | `scheduler.c` / `scheduler_demo.c` | auto-discovers dependency waves; analytically correct (0 mismatches); TSan-clean (no callback races) |
+| Ordering reused from flecs `DependsOn`/phases (depth-based, no new API) | `scheduler.c` / `scheduler_demo.c` | scrambled registration order still correct; an independent system is ordered by its phase alone (no data conflict); fine-grained `DependsOn` deepens a system one level |
 
 ---
 
@@ -277,10 +278,14 @@ patterns; ThreadSanitizer is the decisive check for value-write races.
    normal cached queries (only benign stats counters + an idempotent
    `prev_match_count` write); **unsafe for `order_by`/sorted queries**, which must
    be excluded or sorted once before the wave.
-3. **Wave packing algorithm.** *Initial implementation exists* (`scheduler.c`:
-   greedy *contiguous* order-preserving packing). Still open: a smarter packer
-   that floats independent systems into earlier waves instead of keeping strict
-   contiguity.
+3. **Wave packing & ordering.** *Implemented* (`scheduler.c`): ordering is reused
+   from flecs `DependsOn`/phases via a per-system *depth* (longest `DependsOn`
+   path), and waves are assigned level-aware — a system lands after every
+   lower-depth (previous-stage) system and after any earlier conflicting system,
+   but independent same-depth systems pack into the earliest valid wave. Broad
+   phase ordering and fine-grained `DependsOn` edges both fall out of depth; no
+   separate ordering API. Still open: smarter packing across levels, and a
+   persistent thread pool.
 4. **Width selection policy.** *Initial implementation exists* (`scheduler.c`:
    `K = clamp(ceil(entities / GRAIN), 1, threads)`, `K = 1` for
    non-`multi_threaded` systems). Still open: cost-feedback sizing vs. the static

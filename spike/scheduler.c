@@ -73,8 +73,10 @@ struct ecs_scheduler_t {
     int          width[MAX_SYS];      /* K per system */
     int          nsystems;
 
-    /* waves, as ranges over `systems` (order preserved) */
-    int wave_sys_start[MAX_SYS], wave_sys_count[MAX_SYS];
+    /* ordering derived from flecs DependsOn/phases */
+    int depth[MAX_SYS];               /* longest DependsOn path length */
+    int order[MAX_SYS];               /* system indices sorted by (depth, id) */
+    int wave_of[MAX_SYS];             /* wave index assigned to each system */
     int nwaves;
 
     /* flat task list, grouped by wave */
@@ -99,6 +101,22 @@ ecs_scheduler_t* scheduler_new(ecs_world_t *world, int threads) {
 void scheduler_add(ecs_scheduler_t *s, ecs_entity_t system) {
     ecs_assert(s->nsystems < MAX_SYS, ECS_INVALID_OPERATION, "too many systems");
     s->systems[s->nsystems++] = system;
+}
+
+/* Longest DependsOn path length to a root. Reuses flecs' relationship data:
+ * a system's phase (DependsOn a phase entity) and any fine-grained
+ * DependsOn(system, system) both contribute. Phase chains run ~10 deep, so
+ * recomputation is cheap; `guard` catches accidental cycles. */
+static int dep_depth(ecs_world_t *world, ecs_entity_t e, int guard) {
+    ecs_assert(guard > 0, ECS_INVALID_OPERATION, "DependsOn cycle detected");
+    int max = -1;
+    for (int i = 0; ; i++) {
+        ecs_entity_t t = ecs_get_target(world, e, EcsDependsOn, i);
+        if (!t) break;
+        int d = dep_depth(world, t, guard - 1);
+        if (d > max) max = d;
+    }
+    return max + 1;   /* no targets -> 0 */
 }
 
 static int count_entities(ecs_world_t *world, ecs_entity_t sys) {
@@ -127,39 +145,59 @@ void scheduler_build(ecs_scheduler_t *s) {
         }
     }
 
-    /* 2. greedy order-preserving wave packing: each wave is a maximal run of
-     *    consecutive systems that are pairwise conflict-free. Systems in an
-     *    earlier wave are fully merged before a later wave runs, so only
-     *    same-wave conflicts matter. */
-    s->nwaves = 0;
-    int i = 0;
-    while (i < s->nsystems) {
-        int start = i;
-        int count = 1;
-        i++;
-        while (i < s->nsystems) {
-            int ok = 1;
-            for (int j = start; j < start + count; j++) {
-                if (conflicts(&s->access[i], &s->access[j])) { ok = 0; break; }
-            }
-            if (!ok) break;
-            count++; i++;
+    /* 2. ordering from flecs DependsOn/phases: depth + (depth, entity id) sort.
+     *    Same depth => DependsOn-independent (a dep would deepen it). */
+    for (int i = 0; i < s->nsystems; i++) {
+        s->depth[i] = dep_depth(world, s->systems[i], 4096);
+        s->order[i] = i;
+    }
+    /* insertion sort by (depth, entity id) -- entity id is flecs' within-phase
+     * tiebreak, which also resolves direction for same-depth data conflicts */
+    for (int i = 1; i < s->nsystems; i++) {
+        int oi = s->order[i], j = i - 1;
+        while (j >= 0) {
+            int oj = s->order[j];
+            int after = (s->depth[oj] > s->depth[oi]) ||
+                (s->depth[oj] == s->depth[oi] && s->systems[oj] > s->systems[oi]);
+            if (!after) break;
+            s->order[j + 1] = oj; j--;
         }
-        s->wave_sys_start[s->nwaves] = start;
-        s->wave_sys_count[s->nwaves] = count;
-        s->nwaves++;
+        s->order[j + 1] = oi;
     }
 
-    /* 3. flatten into (system, k, K) tasks grouped by wave */
+    /* 3. wave assignment. Walking in (depth, id) order, a system must land in a
+     *    strictly later wave than any earlier system P when P is in a previous
+     *    stage (depth[P] < depth[S]) OR P data-conflicts with S. Otherwise it
+     *    may share P's wave. This honors "run after all previous-stage systems"
+     *    (broad phase ordering) and conflict direction (P precedes S in id
+     *    order), while letting independent same-depth systems pack together. */
+    s->nwaves = 0;
+    for (int a = 0; a < s->nsystems; a++) {
+        int si = s->order[a];
+        int min_wave = 0;
+        for (int b = 0; b < a; b++) {
+            int pi = s->order[b];
+            int must_after = (s->depth[pi] < s->depth[si]) ||
+                             conflicts(&s->access[pi], &s->access[si]);
+            if (must_after && s->wave_of[pi] + 1 > min_wave)
+                min_wave = s->wave_of[pi] + 1;
+        }
+        s->wave_of[si] = min_wave;
+        if (min_wave + 1 > s->nwaves) s->nwaves = min_wave + 1;
+    }
+
+    /* 4. flatten into (system, k, K) tasks grouped by wave, preserving
+     *    (depth, id) order within each wave. */
     s->ntasks = 0;
     for (int w = 0; w < s->nwaves; w++) {
         s->wave_task_start[w] = s->ntasks;
-        int ss = s->wave_sys_start[w], sc = s->wave_sys_count[w];
-        for (int j = ss; j < ss + sc; j++) {
-            int K = s->width[j];
+        for (int a = 0; a < s->nsystems; a++) {
+            int si = s->order[a];
+            if (s->wave_of[si] != w) continue;
+            int K = s->width[si];
             for (int k = 0; k < K; k++) {
                 ecs_assert(s->ntasks < MAX_TASKS, ECS_INVALID_OPERATION, "too many tasks");
-                s->tasks[s->ntasks++] = (task_t){ s->systems[j], k, K };
+                s->tasks[s->ntasks++] = (task_t){ s->systems[si], k, K };
             }
         }
         s->wave_task_count[w] = s->ntasks - s->wave_task_start[w];
@@ -224,9 +262,11 @@ void scheduler_print(const ecs_scheduler_t *s) {
         s->nsystems, s->threads, s->nwaves, s->ntasks);
     for (int w = 0; w < s->nwaves; w++) {
         printf("  wave %d:", w);
-        int ss = s->wave_sys_start[w], sc = s->wave_sys_count[w];
-        for (int j = ss; j < ss + sc; j++) {
-            printf(" %s(K=%d)", ecs_get_name(s->world, s->systems[j]), s->width[j]);
+        for (int a = 0; a < s->nsystems; a++) {
+            int si = s->order[a];
+            if (s->wave_of[si] != w) continue;
+            printf(" %s(d=%d,K=%d)", ecs_get_name(s->world, s->systems[si]),
+                s->depth[si], s->width[si]);
         }
         printf("\n");
     }
