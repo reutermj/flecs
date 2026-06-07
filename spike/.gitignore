@@ -14,3 +14,4 @@ option_e
 option_e_tsan
 scheduler_demo
 scheduler_demo_tsan
+*.out
