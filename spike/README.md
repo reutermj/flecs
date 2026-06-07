@@ -324,5 +324,8 @@ schedule: 6 systems, 8 threads, 3 waves, 48 tasks
   Spin) aren't floated into earlier waves. A smarter packer could.
 - Threads are spawned per frame (fork-join); a persistent pool would cut that
   overhead. Performance was explicitly out of scope for this investigation.
-- Respects only the linear registration order; flecs phase boundaries are not
-  treated as hard barriers (add them if phase semantics must be preserved).
+- Ignores flecs phase metadata: it uses the linear order passed to
+  `scheduler_add`, whereas flecs *derives* its run order from phase `DependsOn`
+  chains. To honor phases, feed systems in phase order. (Note: neither flecs nor
+  this scheduler syncs at a phase boundary per se — both insert merges only at
+  data hazards; phases only set the order.)
