@@ -108,8 +108,58 @@ TSAN_OPTIONS="halt_on_error=0" ./option_b_tsan 1   # co-schedules S1+SX: REAL ra
   (`SUMMARY: data race in Sys_WriteB_conflict`) — proving the conflict
   analysis is precisely what provides safety.
 
+### Edge cases covered (expanded)
+
+`option_b.c` now exercises the term forms a naive analysis gets wrong, with
+`system_access()` mirroring flecs' `flecs_pipeline_check_term`:
+
+| Term form | Resolves to | Verified by |
+|-----------|-------------|-------------|
+| owned `$this` default | InOut (read+write) | base case |
+| shared / `up`-traversed default | In (read only) | `UpReadConfig_WriteF` |
+| `EcsIn` / `EcsOut` / `EcsInOut` | read / write / both | all systems |
+| `EcsInOutNone` (`[none]`) | no access (no conflict) | `NoneB` vs B writer |
+| `oper==Not && EcsOut` | write (component add) | `AddMarker` |
+| pair `(Rel,Tgt)` | id matched via `ecs_id_match` | `WritePairApples`/`ReadPairOranges` |
+| wildcard pair `(Rel,*)` | overlaps any `(Rel,X)` | `WritePairWild` |
+| bare `EcsWildcard` write | write barrier (conflicts all) | `write_all` flag |
+
+The spike self-checks its conflict matrix against the expected pairs and runs
+four modes:
+
+```sh
+gcc -g -O1 -I. option_b.c flecs.c -o option_b -lpthread -lm
+./option_b 0   # conflict-free wave of 7 distinct systems -> PASS + "matrix matches expected"
+
+gcc -g -O1 -fsanitize=thread -DN=20000 -I. option_b.c flecs.c -o option_b_tsan -lpthread -lm
+TSAN_OPTIONS="halt_on_error=0" ./option_b_tsan 0   # wave: only benign counters, no Sys_ races
+TSAN_OPTIONS="halt_on_error=0" ./option_b_tsan 1   # plain B write/write           -> race in Sys_WriteB2
+TSAN_OPTIONS="halt_on_error=0" ./option_b_tsan 2   # wildcard pair vs concrete     -> race in Sys_WritePairWild
+TSAN_OPTIONS="halt_on_error=0" ./option_b_tsan 3   # shared up-read vs Config write -> race in Sys_WriteConfig
+```
+
+Per-mode TSan classification (by exact `#0` frame):
+
+| Mode | benign counter races | real component races (`Sys_*`) |
+|------|----------------------|--------------------------------|
+| 0 conflict-free wave | 101 | **0** |
+| 1 plain write/write   | 2 | 1 (`Sys_WriteB2`, B storage) |
+| 2 wildcard overlap    | 1 | 1 (`Sys_WritePairWild`, Likes pair) |
+| 3 shared-read vs write| 1 | 1 (`Sys_WriteConfig`, Config) |
+
+> Classification note: TSan does not print struct field names, so a "heap
+> block" race is not automatically a component-storage race. Classify by the
+> `#0` frame: every non-`Sys_*` race here is a non-atomic `ecs_os_linc` into a
+> diagnostic counter — the allocator counts (`ecs_os_api_*_count`,
+> `ecs_block_allocator_alloc_count`) **and** `world->info.queries_ran_total`
+> (flecs.c:84713), bumped at the end of every query iteration. A single
+> atomic-OS-API fix (`ecs_os_set_api` with atomic `lainc_`) silences all of
+> them.
+
 Conclusion: multi-system task parallelism is feasible on flecs today, given a
-scheduler that (a) extracts per-system access from query terms, (b) only
-co-schedules non-conflicting systems, (c) runs each on its own stage during a
-single readonly window, and (d) merges serially. The term metadata needed for
-(a) is already public via `ecs_system_get`.
+scheduler that (a) extracts per-system access from query terms — including
+pairs, wildcards, shared/up terms and `Not`+`Out` adds, (b) only co-schedules
+non-conflicting systems, (c) runs each on its own stage during a single
+readonly window, and (d) merges serially. The term metadata needed for (a) is
+already public via `ecs_system_get`, and `flecs_pipeline_check_term` is the
+reference for resolving it.
